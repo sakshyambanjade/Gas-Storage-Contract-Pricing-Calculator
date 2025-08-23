@@ -1,10 +1,18 @@
-# app.py
+# server/app.py
 from __future__ import annotations
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 import pandas as pd
 import numpy as np
+from scipy.stats import norm
 from typing import Dict, List
+
+# Optional GARCH support
+try:
+    from arch import arch_model
+    _HAS_ARCH = True
+except Exception:
+    _HAS_ARCH = False
 
 app = Flask(__name__)
 CORS(app)
@@ -12,298 +20,187 @@ CORS(app)
 # -------------------------------
 # Helpers
 # -------------------------------
-
-ALLOWED_EXTS = (".csv", ".xlsx", ".xls", ".json")
-
-# Gas/IoT related columns we try to detect (case-insensitive)
-KNOWN_COLS = [
-    "date", "price", "spotprice", "futuresprice",
-    "open", "high", "low", "close", "volume",
-    "pressure", "temperature", "demand", "supply",
-    "location", "region", "hub"
-]
-
-def _ext(filename: str) -> str:
-    return (filename or "").lower().rsplit(".", 1)[-1] if "." in (filename or "") else ""
-
-def read_any_dataframe(file_storage) -> pd.DataFrame:
-    name = (file_storage.filename or "").lower()
-    if name.endswith(".csv"):
-        return pd.read_csv(file_storage)
-    if name.endswith(".xlsx") or name.endswith(".xls"):
-        return pd.read_excel(file_storage)
-    if name.endswith(".json"):
-        return pd.read_json(file_storage)
-    # Fallback try CSV
-    return pd.read_csv(file_storage)
-
-def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
-    df = df.copy()
-    df.columns = [str(c).strip() for c in df.columns]
-    # Build mapping to canonical lower-cased names where possible (date/price/etc.)
-    mapping = {}
-    for c in df.columns:
-        lc = c.lower().strip()
-        if lc in KNOWN_COLS and lc not in df.columns:
-            mapping[c] = lc
-        else:
-            # If header case differs, still normalize to lowercase
-            mapping[c] = lc
-    df = df.rename(columns=mapping)
-    return df
-
-def coerce_dtypes(df: pd.DataFrame) -> pd.DataFrame:
-    df = df.copy()
-
-    # Parse date
-    if "date" in df.columns:
-        df["date"] = pd.to_datetime(df["date"], errors="coerce")
-
-    # Numeric candidates (we will convert safely)
-    numeric_candidates = set(df.columns) & set([
-        "price", "spotprice", "futuresprice",
-        "open", "high", "low", "close",
-        "volume", "pressure", "temperature",
-        "demand", "supply"
-    ])
-    for col in numeric_candidates:
-        df[col] = pd.to_numeric(df[col], errors="coerce")
-
-    # Basic cleanup
-    if "date" in df.columns:
-        df = df.dropna(subset=["date"]).sort_values("date")
-
-    return df
-
-def detect_series(df: pd.DataFrame) -> Dict[str, str]:
-    """Return a dict indicating which key series exist."""
-    present = {}
-    for col in ["price", "spotprice", "futuresprice", "close", "open", "high", "low",
-                "volume", "pressure", "temperature", "demand", "supply"]:
-        if col in df.columns:
-            present[col] = col
-    return present
-
 def _safe_float(x):
-    if pd.isna(x):
-        return None
     try:
+        if x is None or (isinstance(x, float) and np.isnan(x)):
+            return None
         return float(x)
     except Exception:
         return None
 
-def compute_core_metrics(df: pd.DataFrame) -> Dict:
-    """Compute stats for price-like series and general analytics."""
-    out = {
-        "rows": int(len(df)),
-        "columns": list(df.columns),
-        "has_date": bool("date" in df.columns),
+def compute_var_cvar(returns: np.ndarray, conf: float = 0.05, horizon: int = 1) -> Dict:
+    """
+    returns: numpy array of simple returns (e.g. 0.01 = +1%)
+    conf: tail probability (e.g. 0.05 for 5% VaR)
+    horizon: days to scale
+    Returns parametric VaR, historical VaR, CVaR as positive numbers (losses).
+    """
+    r = np.asarray(returns, dtype=float)
+    r = r[~np.isnan(r)]
+    if r.size == 0:
+        return {"parametric_var": None, "historical_var": None, "cvar": None}
+
+    # parametric (normal) VaR
+    mu = r.mean()
+    sigma = r.std(ddof=1)
+    scale = np.sqrt(horizon)
+    # norm.ppf(conf) gives negative for small conf, so parametric VaR = -(mu*horizon + sigma*sqrt(horizon)*norm.ppf(conf))
+    param_var = -(mu * horizon + sigma * scale * norm.ppf(conf))
+
+    # historical VaR: quantile of returns
+    hist_var = -np.quantile(r, conf)
+
+    # CVaR: average loss beyond quantile
+    threshold = np.quantile(r, conf)
+    tail = r[r <= threshold]
+    if tail.size > 0:
+        cvar = -tail.mean()
+    else:
+        cvar = hist_var
+
+    return {
+        "parametric_var": float(param_var),
+        "historical_var": float(hist_var),
+        "cvar": float(cvar)
     }
 
-    # Choose main price series: prefer 'price', then 'close', then 'spotprice'
-    price_col = None
-    for candidate in ["price", "close", "spotprice", "futuresprice", "open"]:
-        if candidate in df.columns:
-            price_col = candidate
-            break
-
-    if "date" in df.columns and not df.empty:
-        out["start_date"] = df["date"].min().strftime("%Y-%m-%d")
-        out["end_date"]   = df["date"].max().strftime("%Y-%m-%d")
-    else:
-        out["start_date"] = None
-        out["end_date"]   = None
-
-    # Stats for all known numeric series that exist
-    numeric_cols = [c for c in df.columns if c != "date" and pd.api.types.is_numeric_dtype(df[c])]
-    summary = {}
-    for col in numeric_cols:
-        series = df[col].dropna()
-        if series.empty:
-            summary[col] = {"mean": None, "std": None, "min": None, "max": None}
-        else:
-            summary[col] = {
-                "mean": _safe_float(series.mean()),
-                "std":  _safe_float(series.std()),
-                "min":  _safe_float(series.min()),
-                "max":  _safe_float(series.max()),
-            }
-    out["summary"] = summary
-
-    # Additional price analytics
-    price_analytics = {}
-    if price_col is not None and pd.api.types.is_numeric_dtype(df[price_col]):
-        p = df[price_col].astype(float)
-        # daily returns (assuming sorted by date already)
-        ret = p.pct_change().replace([np.inf, -np.inf], np.nan).dropna()
-
-        # Annualization conventions for daily data
-        ann_factor = np.sqrt(252.0)
-
-        # Sharpe (no risk-free for simplicity)
-        sharpe = (ret.mean() / (ret.std() + 1e-12)) * ann_factor if not ret.empty else None
-
-        # Volatility (annualized)
-        vol = ret.std() * ann_factor if not ret.empty else None
-
-        # Max drawdown (from price series)
-        roll_max = p.cummax()
-        drawdown = (p / roll_max) - 1.0
-        max_dd = drawdown.min() if not drawdown.empty else None
-
-        # Simple z-score anomalies on price
-        z = (p - p.mean()) / (p.std() + 1e-12) if p.std() not in (0, np.nan) else pd.Series(index=p.index, data=0.0)
-        anomalies_idx = z.index[(z.abs() >= 3)].tolist()
-        anomalies = []
-        if "date" in df.columns:
-            dates = df.loc[anomalies_idx, "date"].dt.strftime("%Y-%m-%d").tolist()
-            vals  = p.loc[anomalies_idx].tolist()
-            anomalies = [{"date": d, "value": _safe_float(v)} for d, v in zip(dates, vals)]
-
-        # Histogram bins for price
-        try:
-            counts, bin_edges = np.histogram(p.dropna(), bins=20)
-            hist = {
-                "bins": [ _safe_float(x) for x in bin_edges.tolist() ],
-                "counts": [ int(x) for x in counts.tolist() ]
-            }
-        except Exception:
-            hist = {"bins": [], "counts": []}
-
-        # Weekly / monthly resample (means)
-        weekly = None
-        monthly = None
-        if "date" in df.columns:
-            tmp = df[["date", price_col]].dropna().copy()
-            tmp = tmp.set_index("date")
-            weekly_df = tmp.resample("W").mean().dropna()
-            monthly_df = tmp.resample("M").mean().dropna()
-            weekly = [{"date": d.strftime("%Y-%m-%d"), price_col: _safe_float(v)} for d, v in weekly_df[price_col].items()]
-            monthly = [{"date": d.strftime("%Y-%m-%d"), price_col: _safe_float(v)} for d, v in monthly_df[price_col].items()]
-
-        price_analytics = {
-            "price_col": price_col,
-            "sharpe": _safe_float(sharpe),
-            "vol_annual": _safe_float(vol),
-            "max_drawdown": _safe_float(max_dd),
-            "histogram": hist,
-            "anomalies": anomalies,
-            "weekly_avg": weekly,
-            "monthly_avg": monthly,
-        }
-
-    out["price_analytics"] = price_analytics
-
-    # Correlation matrix among numeric columns
-    corr = None
-    if len(numeric_cols) >= 2:
-        try:
-            c = df[numeric_cols].corr()
-            corr = {r: {c2: _safe_float(v) for c2, v in c.loc[r].items()} for r in c.index}
-        except Exception:
-            corr = None
-    out["correlations"] = corr
-
-    # Presence map (which typical series exist)
-    out["series_present"] = detect_series(df)
-
-    return out
-
-def to_preview_records(df: pd.DataFrame, limit: int = 200) -> List[Dict]:
-    """Make preview records JSON-serializable (dates -> ISO)."""
-    df = df.copy()
-    if "date" in df.columns and pd.api.types.is_datetime64_any_dtype(df["date"]):
-        df["date"] = df["date"].dt.strftime("%Y-%m-%d")
-    return df.head(limit).to_dict(orient="records")
-
 # -------------------------------
-# Routes
+# Volatility & VaR Endpoint
 # -------------------------------
-
-@app.route("/api/health", methods=["GET"])
-def health():
-    return jsonify({"ok": True})
-
-@app.route("/api/upload-data", methods=["POST"])
-def upload_data():
+@app.route("/api/volatility", methods=["POST"])
+def volatility_endpoint():
     """
-    Accept CSV / Excel / JSON containing gas market and/or IoT sensor data.
-    Auto-detect columns, normalize, and return:
-      - preview rows (first 200)
-      - core analytics (stats, price analytics, correlations, resamples, anomalies)
-      - series_present (which series were found)
-    """
-    if "file" not in request.files:
-        return jsonify({"error": "No file provided"}), 400
-
-    file = request.files["file"]
-    if not file or file.filename.strip() == "":
-        return jsonify({"error": "Empty filename"}), 400
-
-    try:
-        df = read_any_dataframe(file)
-        df = normalize_columns(df)
-        df = coerce_dtypes(df)
-
-        # Must have at least one useful column
-        if df.empty:
-            return jsonify({"error": "No rows after parsing"}), 400
-
-        # If there's no date column, we can still analyze numerics, but charts will be limited
-        analytics = compute_core_metrics(df)
-        preview = to_preview_records(df, limit=200)
-
-        return jsonify({
-            "success": True,
-            "data": preview,
-            "analysis": analytics
-        })
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-
-@app.route("/api/metrics", methods=["POST"])
-def metrics_from_client_data():
-    """
-    Recompute analytics from client-provided rows (e.g., after filtering in UI).
-    Body:
-      {
-        "rows": [ { "date": "YYYY-MM-DD", "price": 2.3, ... }, ... ]
-      }
+    POST JSON:
+    {
+      "priceData": [ {"date": "YYYY-MM-DD", "price": 1.23}, ... ],
+      "var_confidences": [0.01, 0.05, 0.10],   # optional
+      "horizon_days": 1,                      # optional
+      "rolling_window": 30                    # optional
+    }
     """
     try:
-        payload = request.get_json(force=True, silent=False) or {}
-        rows = payload.get("rows", [])
-        if not isinstance(rows, list) or len(rows) == 0:
-            return jsonify({"error": "Provide 'rows' as a non-empty list"}), 400
+        payload = request.get_json(force=True) or {}
+        rows = payload.get("priceData") or payload.get("data") or []
+        confs = payload.get("var_confidences", [0.01, 0.05, 0.10])
+        horizon = int(payload.get("horizon_days", 1))
+        rolling_window = int(payload.get("rolling_window", 30))
+
+        if not isinstance(rows, list) or len(rows) < 5:
+            return jsonify({"error": "Provide priceData as a list with at least 5 rows"}), 400
 
         df = pd.DataFrame(rows)
-        df = normalize_columns(df)
-        df = coerce_dtypes(df)
+        # Normalize columns
+        df.columns = [str(c).strip().lower() for c in df.columns]
 
-        analytics = compute_core_metrics(df)
-        preview = to_preview_records(df, limit=200)
+        # Pick price column
+        if "price" not in df.columns:
+            if "close" in df.columns:
+                df["price"] = df["close"]
+            else:
+                return jsonify({"error": "No 'price' (or 'close') column found in priceData"}), 400
 
-        return jsonify({
-            "success": True,
-            "data": preview,
-            "analysis": analytics
-        })
+        # Parse dates if present
+        if "date" in df.columns:
+            df["date"] = pd.to_datetime(df["date"], errors="coerce")
+            df = df.dropna(subset=["date"])
+            df = df.sort_values("date").reset_index(drop=True)
+        else:
+            # create monotonic index as dates if missing
+            df = df.reset_index().rename(columns={"index": "date"})
+            df["date"] = pd.to_datetime(df["date"], unit="D", origin="1970-01-01")
+
+        # Ensure numeric price and drop NaNs
+        df["price"] = pd.to_numeric(df["price"], errors="coerce")
+        df = df.dropna(subset=["price"]).reset_index(drop=True)
+        if len(df) < 5:
+            return jsonify({"error": "Not enough valid price rows after cleaning"}), 400
+
+        # Compute log returns
+        df["log_ret"] = np.log(df["price"]).diff()
+        df = df.dropna(subset=["log_ret"]).reset_index(drop=True)
+        if len(df) < 3:
+            return jsonify({"error": "Not enough returns to analyze"}), 400
+
+        returns_log = df["log_ret"].values
+        # convert log returns to simple returns for VaR (r = exp(log_ret)-1)
+        simple_returns = np.expm1(returns_log)
+
+        # Basic meta
+        result = {
+            "rows": int(len(df)),
+            "start_date": df["date"].min().strftime("%Y-%m-%d") if "date" in df.columns else None,
+            "end_date": df["date"].max().strftime("%Y-%m-%d") if "date" in df.columns else None,
+            "model": None,
+        }
+
+        # Attempt GARCH(1,1)
+        garch_vol_series = None
+        garch_forecast_1 = None
+        garch_params = None
+        if _HAS_ARCH and len(returns_log) > 50:
+            try:
+                # Fit GARCH on percentage-style (arch likes non-tiny values), multiply by 100
+                am = arch_model(returns_log * 100.0, vol="Garch", p=1, q=1, mean="Constant", dist="normal")
+                res = am.fit(disp="off")
+                cond_var = res.conditional_variance  # in (percent^2)
+                cond_vol = np.sqrt(cond_var) / 100.0  # back to decimal daily stdev approx
+                # Align last dates
+                vol_dates = df["date"].iloc[-len(cond_vol):].dt.strftime("%Y-%m-%d").tolist()
+                garch_vol_series = [{"date": d, "vol": float(v)} for d, v in zip(vol_dates, cond_vol.tolist())]
+
+                # 1-step ahead forecast
+                forecasts = res.forecast(horizon=1, reindex=False)
+                if hasattr(forecasts, "variance"):
+                    fvar = forecasts.variance.values[-1, 0]
+                    garch_forecast_1 = float(np.sqrt(fvar)) / 100.0
+                garch_params = {k: _safe_float(v) for k, v in res.params.items()}
+                result["model"] = "GARCH(1,1)"
+                result["garch_params"] = garch_params
+                result["vol_series_garch"] = garch_vol_series
+                result["vol_forecast_garch_1"] = _safe_float(garch_forecast_1)
+            except Exception as e:
+                # if GARCH fitting fails, we do not stop — fallback to rolling vol
+                result["model"] = "GARCH_failed"
+                result["garch_error"] = str(e)
+        else:
+            result["model"] = "rolling_or_no_arch"
+
+        # Rolling volatility (always compute as fallback / baseline)
+        if rolling_window < 2:
+            rolling_window = 30
+        rolling_std = pd.Series(returns_log).rolling(window=rolling_window).std()
+        # align dates
+        vol_dates = df["date"].iloc[-len(rolling_std):].dt.strftime("%Y-%m-%d").tolist()
+        vol_values = rolling_std.fillna(method="bfill").tolist()
+        result["rolling_vol"] = [{"date": d, "vol": _safe_float(v)} for d, v in zip(vol_dates, vol_values)]
+
+        # VaR & CVaR for requested confidences
+        var_results = {}
+        for conf in confs:
+            try:
+                vr = compute_var_cvar(simple_returns, conf=float(conf), horizon=int(horizon))
+                var_results[f"{int(conf*100)}pct"] = vr
+            except Exception as e:
+                var_results[f"{int(conf*100)}pct"] = {"error": str(e)}
+
+        result["var"] = var_results
+
+        # Return some return stats
+        result["return_stats"] = {
+            "mean": float(np.nanmean(simple_returns)),
+            "std": float(np.nanstd(simple_returns, ddof=1)),
+            "skew": float(pd.Series(simple_returns).skew()),
+            "kurtosis": float(pd.Series(simple_returns).kurtosis())
+        }
+
+        return jsonify({"success": True, "analysis": result})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
-# Optional: keep your existing endpoints if you have a pricing engine
-# @app.route("/api/calculate-contract", methods=["POST"])
-# def calculate_contract():
-#     try:
-#         payload = request.get_json(force=True) or {}
-#         price_data = pd.DataFrame(payload.get("priceData", []))
-#         params = payload.get("parameters", {})
-#         # results = PricingEngine().calculate_contract_price(price_data, params)
-#         results = {"message": "Hook your pricing engine here."}
-#         return jsonify(results)
-#     except Exception as e:
-#         return jsonify({"error": str(e)}), 500
+# Health check
+@app.route("/api/health", methods=["GET"])
+def health():
+    return jsonify({"ok": True, "has_arch": _HAS_ARCH})
 
 if __name__ == "__main__":
-    # Run on localhost:5000 by default
     app.run(debug=True, port=5000)
